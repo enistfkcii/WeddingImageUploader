@@ -16,18 +16,6 @@
 </div>
 
 <div class="app-container">
-    <!-- Wedding Header -->
-    <div class="header">
-        <div class="header-icon">
-            <div class="wedding-logo">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="heart-pulse">
-                    <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
-                </svg>
-            </div>
-        </div>
-        <p class="header-subtitle">Bu özel günün fotoğraf ve videolarını bizimle paylaşın 💕</p>
-    </div>
-
     <!-- Main Upload Card -->
     <div class="upload-card">
         <!-- Status Section -->
@@ -172,6 +160,18 @@
             </div>
         </form>
     </div>
+    @if (IsPreparing)
+    {
+        <div class="position-fixed top-0 start-0 w-100 h-100 d-flex align-items-center justify-content-center bg-white bg-opacity-75" style="z-index:1050;">
+            <div class="bg-white rounded-3 shadow p-4 text-center">
+                <div class="spinner-border text-danger" role="status" style="width:3rem;height:3rem;">
+                    <span class="visually-hidden">Yükleniyor…</span>
+                </div>
+                <div class="mt-3 fw-semibold text-danger">Anılar hazırlanıyor…</div>
+                <div class="small text-muted">Seçtiğiniz fotoğraflar optimize ediliyor</div>
+            </div>
+        </div>
+    }
 </div>
 
 @code {
@@ -213,9 +213,11 @@
     private MarkupString AlertMessage { get; set; } = new("Henüz anı seçilmedi");
     private int ProgressPercentage { get; set; }
     private bool IsUploadDisabled { get; set; } = true;
+    private bool IsProcessingSelection { get; set; } = false;
 
     private Guid InputFileId { get; set; } = Guid.NewGuid();
     private string _packageName = string.Empty;
+    private bool IsPreparing { get; set; } = false;
     private string PackageName
     {
         get => _packageName;
@@ -243,73 +245,87 @@
     {
         ShowSuccessBanner = false;
         ProgressPercentage = 0;
-
-        // Geçici klasör
-        var tempRoot = Path.Combine(Env.WebRootPath, "UploadedFiles", "_temp");
-        Directory.CreateDirectory(tempRoot);
-
-        var picked = e.GetMultipleFiles();
-
-        foreach (var f in picked)
-        {
-            var ct = (f.ContentType ?? "").ToLowerInvariant();
-            if (!AllowedPrefixes.Any(p => ct.StartsWith(p))) continue;
-            if (f.Size > MaxFileSizePerFile) continue;
-
-            // Aynı dosyayı iki kez eklemeyi engelle (Name+Size bazlı)
-            var exists = SelectedFiles.Any(x => x.Name == f.Name && x.Size == f.Size);
-            if (exists) continue;
-
-            // 1) IBrowserFile --> temp dosya (hemen kopyala, sonra IBrowserFile'a ihtiyaç yok)
-            var safeName = MakeEntryNameSafe(f.Name);
-            var tmpPath = GetUniquePath(Path.Combine(tempRoot, $"{Guid.NewGuid():N}-{safeName}"));
-
-            await using (var read = f.OpenReadStream(MaxFileSizePerFile))
-            await using (var write = File.Create(tmpPath))
-            {
-                await read.CopyToAsync(write);
-            }
-
-            SelectedFiles.Add(new TempPickedFile
-            {
-                Name = f.Name,
-                ContentType = ct,
-                Size = (long)f.Size,
-                TempPath = tmpPath,
-                IsImage = ct.StartsWith("image/")
-            });
-
-            // 2) Önizleme (sadece görsel: küçük data url)
-            if (ct.StartsWith("image/"))
-            {
-                try
-                {
-                    var resized = await f.RequestImageFileAsync(ct, 320, 320);
-                    await using var rs = resized.OpenReadStream(MaxFileSizePerFile);
-                    using var ms = new MemoryStream();
-                    await rs.CopyToAsync(ms);
-                    var base64 = Convert.ToBase64String(ms.ToArray());
-                    Previews.Add(new PreviewItem
-                    {
-                        IsImage = true,
-                        Name = f.Name,
-                        DataUrl = $"data:{ct};base64,{base64}",
-                        Kind = "image"
-                    });
-                }
-                catch
-                {
-                    Previews.Add(new PreviewItem { IsImage = false, Name = f.Name, Kind = "image" });
-                }
-            }
-            else
-            {
-                Previews.Add(new PreviewItem { IsImage = false, Name = f.Name, Kind = "video" });
-            }
-        }
-
-        ValidateFormAndToggleButton();
+        IsPreparing = true;                  // AÇ
+        IsUploadDisabled = true;
         StateHasChanged();
+        await Task.Yield();
+
+        try
+        {
+            // Geçici klasör
+            var tempRoot = Path.Combine(Env.WebRootPath, "UploadedFiles", "_temp");
+            Directory.CreateDirectory(tempRoot);
+
+            var picked = e.GetMultipleFiles();
+
+            foreach (var f in picked)
+            {
+                var ct = (f.ContentType ?? "").ToLowerInvariant();
+                if (!AllowedPrefixes.Any(p => ct.StartsWith(p))) continue;
+                if (f.Size > MaxFileSizePerFile) continue;
+
+                // Aynı dosyayı iki kez eklemeyi engelle (Name+Size bazlı)
+                var exists = SelectedFiles.Any(x => x.Name == f.Name && x.Size == f.Size);
+                if (exists) continue;
+
+                // 1) IBrowserFile --> temp dosya (hemen kopyala, sonra IBrowserFile'a ihtiyaç yok)
+                var safeName = MakeEntryNameSafe(f.Name);
+                var tmpPath = GetUniquePath(Path.Combine(tempRoot, $"{Guid.NewGuid():N}-{safeName}"));
+
+                await using (var read = f.OpenReadStream(MaxFileSizePerFile))
+                await using (var write = File.Create(tmpPath))
+                {
+                    await read.CopyToAsync(write);
+                }
+
+                SelectedFiles.Add(new TempPickedFile
+                {
+                    Name = f.Name,
+                    ContentType = ct,
+                    Size = (long)f.Size,
+                    TempPath = tmpPath,
+                    IsImage = ct.StartsWith("image/")
+                });
+
+                // 2) Önizleme (sadece görsel: küçük data url)
+                if (ct.StartsWith("image/"))
+                {
+                    try
+                    {
+                        var resized = await f.RequestImageFileAsync(ct, 320, 320);
+                        await using var rs = resized.OpenReadStream(MaxFileSizePerFile);
+                        using var ms = new MemoryStream();
+                        await rs.CopyToAsync(ms);
+                        var base64 = Convert.ToBase64String(ms.ToArray());
+                        Previews.Add(new PreviewItem
+                        {
+                            IsImage = true,
+                            Name = f.Name,
+                            DataUrl = $"data:{ct};base64,{base64}",
+                            Kind = "image"
+                        });
+                    }
+                    catch
+                    {
+                        Previews.Add(new PreviewItem { IsImage = false, Name = f.Name, Kind = "image" });
+                    }
+                }
+                else
+                {
+                    Previews.Add(new PreviewItem { IsImage = false, Name = f.Name, Kind = "video" });
+                }
+            }
+
+            ValidateFormAndToggleButton();
+            StateHasChanged();
+        }
+        
+        finally
+        {
+            IsPreparing = false;             // KAPAT
+            ValidateFormAndToggleButton();
+            StateHasChanged();
+        }
     }
 
     private async Task OnSubmitAsync()
@@ -474,6 +490,49 @@
 }
 
 <style>
+
+    .busy-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(255,255,255,.55);
+        backdrop-filter: blur(3px);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+    }
+
+    .busy-box {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: .75rem;
+        padding: 1rem 1.25rem;
+        background: rgba(255,255,255,.92);
+        border: 1px solid rgba(236,72,153,.25);
+        border-radius: 1rem;
+        box-shadow: 0 10px 30px rgba(236,72,153,.25);
+    }
+
+    .busy-spinner {
+        width: 42px;
+        height: 42px;
+        border-radius: 50%;
+        border: 3px solid rgba(236,72,153,.25);
+        border-top-color: #ec4899;
+        animation: spin 1s linear infinite;
+    }
+
+    .busy-text {
+        color: #be185d;
+        font-weight: 600;
+    }
+
+    @@keyframes spin {
+        to {
+            transform: rotate(360deg);
+        }
+    }
     /* Wedding Background */
     .wedding-background {
         position: fixed;
