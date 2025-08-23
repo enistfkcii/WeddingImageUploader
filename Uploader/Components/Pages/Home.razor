@@ -327,100 +327,104 @@
         }
     }
 
-    private async Task OnSubmitAsync()
+private async Task OnSubmitAsync()
+{
+    if (SelectedFiles.Count == 0) return;
+    if (string.IsNullOrWhiteSpace(PackageName)) { ValidateFormAndToggleButton(); return; }
+
+    IsUploadDisabled = true;
+
+    var uploadRoot = Path.Combine(Env.WebRootPath, "UploadedFiles");
+    Directory.CreateDirectory(uploadRoot);
+
+    var safeBase = Slugify(PackageName).Trim('-');
+    if (string.IsNullOrWhiteSpace(safeBase)) safeBase = "paket";
+
+    // Benzersiz klasör adı üret
+    var baseDir = Path.Combine(uploadRoot, safeBase);
+    var destDir = baseDir;
+    int i = 2;
+    while (Directory.Exists(destDir))
     {
-        if (SelectedFiles.Count == 0) return;
-        if (string.IsNullOrWhiteSpace(PackageName)) { ValidateFormAndToggleButton(); return; }
+        destDir = $"{baseDir}-{i}";
+        i++;
+    }
+    Directory.CreateDirectory(destDir);
 
-        IsUploadDisabled = true;
+    long totalSize = SelectedFiles.Sum(f => (long)f.Size);
+    long totalWritten = 0;
 
-        var uploadRoot = Path.Combine(Env.WebRootPath, "UploadedFiles");
-        Directory.CreateDirectory(uploadRoot);
+    using var timer = new Timer(_ => InvokeAsync(StateHasChanged));
+    timer.Change(TimeSpan.FromMilliseconds(300), TimeSpan.FromMilliseconds(300));
 
-        var safeBase = Slugify(PackageName).Trim('-');
-        if (string.IsNullOrWhiteSpace(safeBase)) safeBase = "paket";
-        var zipPath = GetUniquePath(Path.Combine(uploadRoot, $"{safeBase}.zip"));
-
-        long totalSize = SelectedFiles.Sum(f => (long)f.Size);
-        long totalWritten = 0;
-
-        using var timer = new Timer(_ => InvokeAsync(StateHasChanged));
-        timer.Change(TimeSpan.FromMilliseconds(300), TimeSpan.FromMilliseconds(300));
+    try
+    {
+        const int bufferSize = 512 * 1024;
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
 
         try
         {
-            using var zipFs = File.Create(zipPath);
-            using var zip = new ZipArchive(zipFs, ZipArchiveMode.Create, leaveOpen: false);
-
-            const int bufferSize = 512 * 1024;
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
-
-            try
+            foreach (var f in SelectedFiles)
             {
-                foreach (var f in SelectedFiles)
+                var destPath = Path.Combine(destDir, MakeEntryNameSafe(f.Name));
+
+                await using var src = File.OpenRead(f.TempPath);
+                await using var dst = File.Create(destPath);
+
+                int read;
+                while ((read = await src.ReadAsync(buffer.AsMemory(0, bufferSize))) != 0)
                 {
-                    var entryName = MakeEntryNameSafe(f.Name);
-                    var entry = zip.CreateEntry(entryName, CompressionLevel.Fastest);
-
-                    await using var entryStream = entry.Open();
-                    await using var src = File.OpenRead(f.TempPath);
-
-                    int read;
-                    while ((read = await src.ReadAsync(buffer.AsMemory(0, bufferSize))) != 0)
-                    {
-                        await entryStream.WriteAsync(buffer.AsMemory(0, read));
-                        totalWritten += read;
-                        ProgressPercentage = (int)(100 * totalWritten / Math.Max(1, totalSize));
-                    }
+                    await dst.WriteAsync(buffer.AsMemory(0, read));
+                    totalWritten += read;
+                    ProgressPercentage = (int)(100 * totalWritten / Math.Max(1, totalSize));
                 }
             }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
-            }
-        }
-        catch (Exception ex)
-        {
-            AlertMessage = new MarkupString($"Yükleme sırasında hata oluştu: <strong>{ex.Message}</strong>");
-            ProgressPercentage = 0;
-            IsUploadDisabled = false;
-            return;
         }
         finally
         {
-            timer.Change(Timeout.Infinite, Timeout.Infinite);
+            ArrayPool<byte>.Shared.Return(buffer);
         }
-
-        ProgressPercentage = 100;
-        uploadList.Add(Path.GetFileName(zipPath));
-
-        // Temizlik...
-        foreach (var f in SelectedFiles)
-        {
-            try { if (File.Exists(f.TempPath)) File.Delete(f.TempPath); } catch { }
-        }
-
-        // İstatistikleri temizlikten ÖNCE al
-        var imageCount = SelectedFiles.Count(f => f.IsImage);
-        var videoCount = SelectedFiles.Count - imageCount;
-
-        // Listeleri temizle
-        SelectedFiles.Clear();
-        Previews.Clear();
-
-        // !!! Setter'ı çağırma, direkt backing field ile sıfırla
-        _packageName = string.Empty;     // <-- kritik
-        InputFileId = Guid.NewGuid();
-        IsUploadDisabled = true;
-
-        // EN SON: başarı bandını aç
-        ShowSuccessBanner = true;
-        SuccessMessage = new MarkupString(
-            $"<strong>Anılar başarıyla paylaşıldı! 💕</strong><br/>{imageCount} Fotoğraf, {videoCount} Video eklendi."
-        );
-
-        StateHasChanged();
     }
+    catch (Exception ex)
+    {
+        AlertMessage = new MarkupString($"Yükleme sırasında hata oluştu: <strong>{ex.Message}</strong>");
+        ProgressPercentage = 0;
+        IsUploadDisabled = false;
+        return;
+    }
+    finally
+    {
+        timer.Change(Timeout.Infinite, Timeout.Infinite);
+    }
+
+    ProgressPercentage = 100;
+    uploadList.Add(Path.GetFileName(destDir)); // klasör adını listeye ekle
+
+    // Temp dosyaları temizle
+    foreach (var f in SelectedFiles)
+    {
+        try { if (File.Exists(f.TempPath)) File.Delete(f.TempPath); } catch { }
+    }
+
+    // İstatistikler
+    var imageCount = SelectedFiles.Count(f => f.IsImage);
+    var videoCount = SelectedFiles.Count - imageCount;
+
+    // Listeleri temizle ve formu sıfırla
+    SelectedFiles.Clear();
+    Previews.Clear();
+    _packageName = string.Empty;
+    InputFileId = Guid.NewGuid();
+    IsUploadDisabled = true;
+
+    ShowSuccessBanner = true;
+    SuccessMessage = new MarkupString(
+        $"<strong>Anılar başarıyla paylaşıldı! 💕</strong><br/>{imageCount} Fotoğraf, {videoCount} Video yüklendi."
+    );
+
+    StateHasChanged();
+}
+
 
     // ===================== HELPERS =====================
     private void ValidateFormAndToggleButton()
