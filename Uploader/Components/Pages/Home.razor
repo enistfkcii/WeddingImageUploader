@@ -248,10 +248,14 @@
 {
     ShowSuccessBanner = false;
     ProgressPercentage = 0;
-    IsPreparing = true;                  // AÇ
+    IsPreparing = true;      // AÇ
     IsUploadDisabled = true;
     StateHasChanged();
     await Task.Yield();
+
+    // UI'ı periyodik güncelle
+    using var timer = new Timer(_ => InvokeAsync(StateHasChanged));
+    timer.Change(TimeSpan.FromMilliseconds(250), TimeSpan.FromMilliseconds(250));
 
     try
     {
@@ -261,78 +265,90 @@
 
         var picked = e.GetMultipleFiles();
 
-        // Seçim ilerleme sayaçları
-        SelectionTotal = picked.Count;
-        SelectionProcessed = 0;
-        SelectionPercentage = 0;
+        const int bufferSize = 512 * 1024;
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
 
-        // Her dosya (kabul/ret) sonrası ilerlemeyi artır
-        async Task BumpAsync()
+        try
         {
-            SelectionProcessed++;
-            SelectionPercentage = (int)(100 * SelectionProcessed / Math.Max(1, SelectionTotal));
-            StateHasChanged();           // progress bar canlı güncellensin
-            await Task.Yield();          // UI donmasın
-        }
-
-        foreach (var f in picked)
-        {
-            var ct = (f.ContentType ?? "").ToLowerInvariant();
-            if (!AllowedPrefixes.Any(p => ct.StartsWith(p))) { await BumpAsync(); continue; }
-            if (f.Size > MaxFileSizePerFile) { await BumpAsync(); continue; }
-
-            // Aynı dosyayı iki kez eklemeyi engelle (Name+Size bazlı)
-            var exists = SelectedFiles.Any(x => x.Name == f.Name && x.Size == f.Size);
-            if (exists) { await BumpAsync(); continue; }
-
-            // 1) IBrowserFile --> temp dosya (hemen kopyala, sonra IBrowserFile'a ihtiyaç yok)
-            var safeName = MakeEntryNameSafe(f.Name);
-            var tmpPath = GetUniquePath(Path.Combine(tempRoot, $"{Guid.NewGuid():N}-{safeName}"));
-
-            await using (var read = f.OpenReadStream(MaxFileSizePerFile))
-            await using (var write = File.Create(tmpPath))
+            foreach (var f in picked)
             {
-                await read.CopyToAsync(write);
-            }
+                var ct = (f.ContentType ?? "").ToLowerInvariant();
+                if (!AllowedPrefixes.Any(p => ct.StartsWith(p))) continue;
+                if (f.Size > MaxFileSizePerFile) continue;
 
-            SelectedFiles.Add(new TempPickedFile
-            {
-                Name = f.Name,
-                ContentType = ct,
-                Size = (long)f.Size,
-                TempPath = tmpPath,
-                IsImage = ct.StartsWith("image/")
-            });
+                // Aynı dosyayı iki kez eklemeyi engelle (Name+Size bazlı)
+                var exists = SelectedFiles.Any(x => x.Name == f.Name && x.Size == (long)f.Size);
+                if (exists) continue;
 
-            // 2) Önizleme (sadece görsel: küçük data url)
-            if (ct.StartsWith("image/"))
-            {
-                try
+                // 1) IBrowserFile --> temp dosya (parça parça kopyala ve yüzdeyi bu dosyaya göre hesapla)
+                var safeName = MakeEntryNameSafe(f.Name);
+                var tmpPath  = GetUniquePath(Path.Combine(tempRoot, $"{Guid.NewGuid():N}-{safeName}"));
+
+                ProgressPercentage = 0; // bu dosya için bar'ı sıfırla
+
+                await using (var read = f.OpenReadStream(MaxFileSizePerFile))
+                await using (var write = File.Create(tmpPath))
                 {
-                    var resized = await f.RequestImageFileAsync(ct, 320, 320);
-                    await using var rs = resized.OpenReadStream(MaxFileSizePerFile);
-                    using var ms = new MemoryStream();
-                    await rs.CopyToAsync(ms);
-                    var base64 = Convert.ToBase64String(ms.ToArray());
-                    Previews.Add(new PreviewItem
+                    long perFileWritten = 0;
+                    int readCount;
+                    while ((readCount = await read.ReadAsync(buffer.AsMemory(0, bufferSize))) != 0)
                     {
-                        IsImage = true,
-                        Name = f.Name,
-                        DataUrl = $"data:{ct};base64,{base64}",
-                        Kind = "image"
-                    });
-                }
-                catch
-                {
-                    Previews.Add(new PreviewItem { IsImage = false, Name = f.Name, Kind = "image" });
-                }
-            }
-            else
-            {
-                Previews.Add(new PreviewItem { IsImage = false, Name = f.Name, Kind = "video" });
-            }
+                        await write.WriteAsync(buffer.AsMemory(0, readCount));
+                        perFileWritten += readCount;
 
-            await BumpAsync();
+                        // Bu dosyanın yüzdesi
+                        var denom = Math.Max(1L, (long)f.Size);
+                        ProgressPercentage = (int)Math.Min(100L, (perFileWritten * 100L) / denom);
+                    }
+                }
+
+                // dosya kopyası bitti, yüzdeyi 100'e sabitle
+                ProgressPercentage = 100;
+
+                SelectedFiles.Add(new TempPickedFile
+                {
+                    Name = f.Name,
+                    ContentType = ct,
+                    Size = (long)f.Size,
+                    TempPath = tmpPath,
+                    IsImage = ct.StartsWith("image/")
+                });
+
+                // 2) Önizleme (sadece görsel: küçük data url)
+                if (ct.StartsWith("image/"))
+                {
+                    try
+                    {
+                        var resized = await f.RequestImageFileAsync(ct, 320, 320);
+                        await using var rs = resized.OpenReadStream(MaxFileSizePerFile);
+                        using var ms = new MemoryStream();
+                        await rs.CopyToAsync(ms);
+                        var base64 = Convert.ToBase64String(ms.ToArray());
+                        Previews.Add(new PreviewItem
+                        {
+                            IsImage = true,
+                            Name = f.Name,
+                            DataUrl = $"data:{ct};base64,{base64}",
+                            Kind = "image"
+                        });
+                    }
+                    catch
+                    {
+                        Previews.Add(new PreviewItem { IsImage = false, Name = f.Name, Kind = "image" });
+                    }
+                }
+                else
+                {
+                    Previews.Add(new PreviewItem { IsImage = false, Name = f.Name, Kind = "video" });
+                }
+
+                // bir SONRAKİ dosyaya geçmeden önce bar'ı tekrar 0'a çek
+                ProgressPercentage = 0;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
 
         ValidateFormAndToggleButton();
@@ -340,11 +356,15 @@
     }
     finally
     {
-        IsPreparing = false;             // KAPAT
+        // timer'ı durdur
+        timer.Change(Timeout.Infinite, Timeout.Infinite);
+
+        IsPreparing = false; // KAPAT
         ValidateFormAndToggleButton();
         StateHasChanged();
     }
 }
+
 
 
 private async Task OnSubmitAsync()
